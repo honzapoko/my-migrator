@@ -485,9 +485,13 @@ def format_date(date_str):
     except:
         return date_str[:10]
 
-def generate_site(sql_bytes, site_name, site_desc):
+def generate_site(sql_bytes, site_name, site_desc, extra_posts=None):
     sql_text = sql_bytes.decode('utf-8', errors='replace')
     posts, raw_cats = parse_sql(sql_text)
+
+    # Merge manually added articles (prepend so they appear newest)
+    if extra_posts:
+        posts = list(extra_posts) + posts
 
     # Deduplicate categories by name, keep ones that have posts
     cat_names_used = set()
@@ -636,68 +640,231 @@ def generate_site(sql_bytes, site_name, site_desc):
 
 
 # ══════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+def slugify(text):
+    """Convert a title to a URL-safe slug."""
+    text = text.lower().strip()
+    # Czech character map
+    for src, dst in [('á','a'),('č','c'),('ď','d'),('é','e'),('ě','e'),('í','i'),
+                     ('ň','n'),('ó','o'),('ř','r'),('š','s'),('ť','t'),('ú','u'),
+                     ('ů','u'),('ý','y'),('ž','z')]:
+        text = text.replace(src, dst)
+    text = re.sub(r'[^a-z0-9\s-]', '', text)
+    text = re.sub(r'[\s]+', '-', text)
+    text = re.sub(r'-+', '-', text).strip('-')
+    return text
+
+def load_extra_posts():
+    """Load manually added articles from session state."""
+    if 'extra_posts' not in st.session_state:
+        st.session_state.extra_posts = []
+    return st.session_state.extra_posts
+
+def save_extra_post(post):
+    if 'extra_posts' not in st.session_state:
+        st.session_state.extra_posts = []
+    st.session_state.extra_posts.append(post)
+
+def delete_extra_post(idx):
+    st.session_state.extra_posts.pop(idx)
+
+
+# ══════════════════════════════════════════════════════════════════
 # STREAMLIT UI
 # ══════════════════════════════════════════════════════════════════
 
-uploaded = st.file_uploader("📂 Upload SQL database (.sql)", type=["sql"])
+tab1, tab2, tab3 = st.tabs(["🗄️ Import z SQL", "✏️ Přidat článek", "📋 Moje články"])
 
-if uploaded:
-    # Auto-detect site name from filename
-    raw_name = uploaded.name.rsplit('.', 1)[0]
-    default_name = re.sub(r'[-_]?(export|backup|db|dump)[-_]?', '', raw_name, flags=re.IGNORECASE).strip('-_ ').capitalize()
-    if not default_name:
-        default_name = "Můj web"
+# ──────────────────────────────────────────────────────────────────
+# TAB 1 — Import from SQL + Generate
+# ──────────────────────────────────────────────────────────────────
+with tab1:
+    st.markdown("#### Nahraj WordPress SQL databázi a vygeneruj statický web")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        site_name = st.text_input("Název webu", value=default_name)
-    with col2:
-        site_desc = st.text_input("Popis webu", value="Informační portál")
+    uploaded = st.file_uploader("📂 Upload SQL database (.sql)", type=["sql"])
 
-    zip_filename = f"{site_name}.zip"
+    if uploaded:
+        raw_name = uploaded.name.rsplit('.', 1)[0]
+        default_name = re.sub(r'[-_]?(export|backup|db|dump)[-_]?', '', raw_name, flags=re.IGNORECASE).strip('-_ ').capitalize()
+        if not default_name:
+            default_name = "Můj web"
 
-    if st.button("🚀 Generovat web", type="primary"):
-        with st.spinner("Čistím malware a generuji stránky…"):
-            sql_bytes = uploaded.getvalue()
-            files, posts, categories = generate_site(sql_bytes, site_name, site_desc)
+        col1, col2 = st.columns(2)
+        with col1:
+            site_name = st.text_input("Název webu", value=default_name, key="t1_name")
+        with col2:
+            site_desc = st.text_input("Popis webu", value="Informační portál", key="t1_desc")
 
-        # Stats
-        n_posts = sum(1 for p in posts if p['post_type'] == 'post')
-        n_pages = sum(1 for p in posts if p['post_type'] == 'page')
-        n_cats = len(categories)
-        n_files = len(files)
+        # Store site name/desc in session for use in tab 2
+        st.session_state['site_name'] = site_name
+        st.session_state['site_desc'] = site_desc
+        st.session_state['sql_bytes'] = uploaded.getvalue()
 
-        st.success(f"✅ Web vygenerován! {n_files} souborů připraveno.")
+        zip_filename = f"{site_name}.zip"
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Články", n_posts)
-        col2.metric("Stránky + kategorie", n_pages + n_cats)
-        col3.metric("Celkem souborů", n_files)
+        if st.button("🚀 Generovat web", type="primary"):
+            with st.spinner("Čistím malware a generuji stránky…"):
+                sql_bytes = uploaded.getvalue()
+                extra_posts = load_extra_posts()
+                files, posts, categories = generate_site(sql_bytes, site_name, site_desc, extra_posts)
 
-        # Check for posts with no content
-        empty = [p['title'] for p in posts if not p['content'] and p['post_type'] == 'post']
-        if empty:
-            st.markdown(f'<div class="warn">⚠️ {len(empty)} článků bez obsahu (pravděpodobně smazáno hackery): {", ".join(empty[:5])}{"…" if len(empty) > 5 else ""}</div>', unsafe_allow_html=True)
+            n_posts = sum(1 for p in posts if p['post_type'] == 'post')
+            n_pages = sum(1 for p in posts if p['post_type'] == 'page')
+            n_cats  = len(categories)
+            n_files = len(files)
+            n_extra = len(extra_posts)
 
-        # Build ZIP
-        zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for path, content in files.items():
-                zf.writestr(path, content.encode('utf-8') if isinstance(content, str) else content)
+            st.success(f"✅ Web vygenerován! {n_files} souborů připraveno.")
 
-        st.download_button(
-            label=f"⬇️ Stáhnout {zip_filename}",
-            data=zip_buf.getvalue(),
-            file_name=zip_filename,
-            mime="application/zip"
-        )
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Články (SQL)", n_posts - n_extra)
+            col2.metric("Ručně přidané", n_extra)
+            col3.metric("Celkem souborů", n_files)
 
-        st.markdown("---")
-        st.markdown("""
+            empty = [p['title'] for p in posts if not p['content'] and p['post_type'] == 'post']
+            if empty:
+                st.markdown(f'<div class="warn">⚠️ {len(empty)} článků bez obsahu: {", ".join(empty[:5])}{"…" if len(empty) > 5 else ""}</div>', unsafe_allow_html=True)
+
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for path, content in files.items():
+                    zf.writestr(path, content.encode('utf-8') if isinstance(content, str) else content)
+
+            st.download_button(
+                label=f"⬇️ Stáhnout {zip_filename}",
+                data=zip_buf.getvalue(),
+                file_name=zip_filename,
+                mime="application/zip"
+            )
+
+            st.markdown("---")
+            st.markdown("""
 **Další kroky:**
 1. Rozbal ZIP → dostaneš složku se soubory
 2. Zkopíruj `wp-content/` ze starého WordPress webu do rozbalené složky
 3. Přejdi na **Cloudflare → Workers & Pages → Pages → Upload assets**
 4. Přetáhni celý obsah složky do Cloudflare
 5. ✅ Web je živý!
+            """)
+    else:
+        st.info("👆 Nahraj SQL soubor výše pro zahájení.")
+
+
+# ──────────────────────────────────────────────────────────────────
+# TAB 2 — Add new article
+# ──────────────────────────────────────────────────────────────────
+with tab2:
+    st.markdown("#### Napsat nový článek")
+    st.markdown("Článek se uloží do tohoto prohlížeče a přidá se k webu při příštím generování.")
+
+    # Try to get categories from last SQL parse, or allow manual entry
+    known_cats = []
+    if 'sql_bytes' in st.session_state:
+        try:
+            _, raw_cats = parse_sql(st.session_state['sql_bytes'].decode('utf-8', errors='replace'))
+            known_cats = sorted(set(c['name'] for c in raw_cats))
+        except:
+            pass
+
+    with st.form("new_article_form", clear_on_submit=True):
+        art_title = st.text_input("Název článku *", placeholder="Jak pomoci dítěti s ADHD ve škole")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if known_cats:
+                cat_options = known_cats + ["+ Nová kategorie"]
+                cat_choice = st.selectbox("Kategorie", cat_options)
+                if cat_choice == "+ Nová kategorie":
+                    art_cat = st.text_input("Název nové kategorie")
+                else:
+                    art_cat = cat_choice
+            else:
+                art_cat = st.text_input("Kategorie", placeholder="O ADHD")
+        with col2:
+            art_author = st.text_input("Autor", value="Redakce")
+
+        art_excerpt = st.text_input("Krátký popis (zobrazí se na homepage)", placeholder="Stručný úvod článku…")
+
+        art_content = st.text_area(
+            "Obsah článku *",
+            height=350,
+            placeholder="""Napište obsah článku. Podporuje základní HTML:
+
+<h2>Nadpis sekce</h2>
+<p>Odstavec textu...</p>
+<strong>tučně</strong>, <em>kurzíva</em>
+<ul><li>položka seznamu</li></ul>
+<img src="/wp-content/uploads/obrazek.jpg" alt="popis">"""
+        )
+
+        art_date = st.date_input("Datum publikace", value=datetime.today())
+
+        submitted = st.form_submit_button("💾 Uložit článek", type="primary")
+
+        if submitted:
+            if not art_title.strip():
+                st.error("Název článku je povinný.")
+            elif not art_content.strip():
+                st.error("Obsah článku je povinný.")
+            else:
+                new_post = {
+                    'id': 90000 + len(load_extra_posts()),
+                    'author': art_author or 'Redakce',
+                    'date': art_date.strftime('%Y-%m-%d %H:%M:%S'),
+                    'content': art_content.strip(),
+                    'title': art_title.strip(),
+                    'excerpt': art_excerpt.strip(),
+                    'slug': slugify(art_title.strip()),
+                    'post_type': 'post',
+                    'categories': [art_cat] if art_cat else [],
+                    'manual': True,
+                }
+                save_extra_post(new_post)
+                st.success(f"✅ Článek **{art_title}** uložen! Přejdi na záložku 📋 Moje články pro přehled, nebo rovnou generuj web v záložce 🗄️ Import z SQL.")
+
+    st.markdown("---")
+    st.markdown("""
+💡 **Tip:** Obsah píšeš v HTML. Není to tak složité — základní tagy:
+- `<h2>Nadpis</h2>` — podnadpis
+- `<p>Text odstavce.</p>` — odstavec  
+- `<strong>tučně</strong>` — tučný text
+- `<a href="https://...">text odkazu</a>` — odkaz
+- `<img src="/wp-content/uploads/soubor.jpg" alt="">` — obrázek z wp-content
+    """)
+
+
+# ──────────────────────────────────────────────────────────────────
+# TAB 3 — List of manually added articles
+# ──────────────────────────────────────────────────────────────────
+with tab3:
+    st.markdown("#### Ručně přidané články")
+
+    extra = load_extra_posts()
+
+    if not extra:
+        st.info("Zatím žádné ručně přidané články. Přejdi na záložku ✏️ Přidat článek.")
+    else:
+        st.markdown(f"Celkem: **{len(extra)}** článků připraveno k přidání do webu.")
+        st.markdown("---")
+
+        for i, p in enumerate(extra):
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                cats = ", ".join(p['categories']) if p['categories'] else "—"
+                date_fmt = p['date'][:10]
+                st.markdown(f"**{p['title']}**  \n🗂️ {cats} &nbsp;|&nbsp; 📅 {date_fmt} &nbsp;|&nbsp; ✍️ {p['author']}")
+                if p['excerpt']:
+                    st.caption(p['excerpt'])
+            with col2:
+                if st.button("🗑️ Smazat", key=f"del_{i}"):
+                    delete_extra_post(i)
+                    st.rerun()
+            st.markdown("---")
+
+        st.markdown("""
+> ℹ️ Tyto články jsou uloženy v session (v paměti prohlížeče).  
+> Pokud zavřeš nebo obnovíš stránku, budou ztraceny.  
+> **Vždy generuj web před zavřením záložky.**
         """)
